@@ -609,6 +609,9 @@ pub struct KittyImagePlacement {
     pub placement_id: Option<u32>,
     /// z=...
     pub z_index: Option<i32>,
+    /// Whether this is a virtual placement for Unicode placeholders.
+    /// U=0, U=1
+    pub unicode_placeholder: bool,
 }
 
 impl KittyImagePlacement {
@@ -629,6 +632,11 @@ impl KittyImagePlacement {
                 _ => return None,
             },
             z_index: geti(keys, "z"),
+            unicode_placeholder: match get(keys, "U") {
+                None | Some("0") => false,
+                Some("1") => true,
+                _ => return None,
+            },
         })
     }
 
@@ -648,6 +656,10 @@ impl KittyImagePlacement {
         }
 
         set(keys, "z", &self.z_index);
+
+        if self.unicode_placeholder {
+            keys.insert("U", "1".to_string());
+        }
     }
 }
 
@@ -713,6 +725,14 @@ pub enum KittyImageDelete {
     /// d='z' or d='Z'
     /// Delete all placements that have the specified z-index.
     DeleteZ { z: i32, delete: bool },
+
+    /// d='r' or d='R'
+    /// Delete all images with image_id in range [id_start..=id_end].
+    ByImageIdRange {
+        id_start: u32,
+        id_end: u32,
+        delete: bool,
+    },
 }
 
 impl KittyImageDelete {
@@ -758,6 +778,11 @@ impl KittyImageDelete {
             }),
             'z' | 'Z' => Some(Self::DeleteZ {
                 z: geti(keys, "z")?,
+                delete,
+            }),
+            'r' | 'R' => Some(Self::ByImageIdRange {
+                id_start: geti(keys, "x")?,
+                id_end: geti(keys, "y")?,
                 delete,
             }),
             _ => None,
@@ -823,6 +848,15 @@ impl KittyImageDelete {
             Self::DeleteZ { z, delete } => {
                 keys.insert("d", d('z', delete));
                 keys.insert("z", z.to_string());
+            }
+            Self::ByImageIdRange {
+                id_start,
+                id_end,
+                delete,
+            } => {
+                keys.insert("d", d('r', delete));
+                keys.insert("x", id_start.to_string());
+                keys.insert("y", id_end.to_string());
             }
         }
     }
