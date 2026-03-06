@@ -25,6 +25,7 @@ use wezterm_escape_parser::csi::{
 use wezterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use wezterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 
+pub(crate) mod diacritics;
 mod image;
 mod iterm;
 mod keyboard;
