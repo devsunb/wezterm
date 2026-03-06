@@ -17,13 +17,28 @@ use wezterm_escape_parser::apc::{
 };
 use wezterm_surface::change::ImageData;
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct VirtualPlacement {
+    pub columns: Option<u32>,
+    pub rows: Option<u32>,
+    pub x: Option<u32>,
+    pub y: Option<u32>,
+    pub w: Option<u32>,
+    pub h: Option<u32>,
+    pub z_index: Option<i32>,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct KittyImageState {
     accumulator: Vec<KittyImage>,
     max_image_id: u32,
-    number_to_id: HashMap<u32, u32>,
-    id_to_data: HashMap<u32, Arc<ImageData>>,
+    pub(crate) number_to_id: HashMap<u32, u32>,
+    pub(crate) id_to_data: HashMap<u32, Arc<ImageData>>,
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    pub(crate) virtual_placements: HashMap<(u32, Option<u32>), VirtualPlacement>,
     used_memory: usize,
 }
 
@@ -46,7 +61,8 @@ impl KittyImageState {
     fn prune_unreferenced(&mut self) {
         let budget = 320 * 1024 * 1024; // FIXME: make this configurable
         if self.used_memory > budget {
-            let referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+            let mut referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
+            referenced.extend(self.virtual_placements.keys().map(|(k, _)| *k));
             let target = self.used_memory - budget;
             let mut freed = 0;
             self.id_to_data.retain(|id, data| {
@@ -100,6 +116,33 @@ impl TerminalState {
             placement,
             verbosity
         );
+
+        if placement.unicode_placeholder {
+            let img = Arc::clone(self.kitty_img.id_to_data.get(&image_id).ok_or_else(|| {
+                anyhow::anyhow!("no matching image id {} for virtual placement", image_id)
+            })?);
+            let (image_width, image_height) = img.data().dimensions()?;
+            let vp = VirtualPlacement {
+                columns: placement.columns,
+                rows: placement.rows,
+                x: placement.x,
+                y: placement.y,
+                w: placement.w,
+                h: placement.h,
+                z_index: placement.z_index,
+                image_width,
+                image_height,
+            };
+            self.kitty_img
+                .virtual_placements
+                .insert((image_id, placement.placement_id), vp.clone());
+            // Don't store a fallback at (image_id, None); the lookup in
+            // kitty_img_place_run will iterate virtual_placements to find
+            // any placement matching the image_id when the exact key misses.
+            self.kitty_send_response(verbosity, true, Some(image_id), None, "OK".to_string());
+            return Ok(());
+        }
+
         if image_id != 0 {
             self.kitty_remove_placement(image_id, placement.placement_id);
         }
@@ -267,6 +310,45 @@ impl TerminalState {
             } => {
                 self.kitty_remove_all_placements(delete);
             }
+            KittyImage::Delete {
+                what:
+                    KittyImageDelete::ByImageNumber {
+                        image_number,
+                        placement_id,
+                        delete,
+                    },
+                verbosity: _,
+            } => {
+                if let Some(&image_id) = self.kitty_img.number_to_id.get(&image_number) {
+                    self.kitty_remove_placement(image_id, placement_id);
+                    if delete {
+                        self.kitty_img.remove_data_for_id(image_id);
+                    }
+                }
+            }
+            KittyImage::Delete {
+                what:
+                    KittyImageDelete::ByImageIdRange {
+                        id_start,
+                        id_end,
+                        delete,
+                    },
+                verbosity: _,
+            } => {
+                let ids_in_range: Vec<u32> = self
+                    .kitty_img
+                    .id_to_data
+                    .keys()
+                    .copied()
+                    .filter(|id| *id >= id_start && *id <= id_end)
+                    .collect();
+                for image_id in ids_in_range {
+                    self.kitty_remove_placement(image_id, None);
+                    if delete {
+                        self.kitty_img.remove_data_for_id(image_id);
+                    }
+                }
+            }
             KittyImage::Delete { what, verbosity } => {
                 log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
             }
@@ -315,6 +397,9 @@ impl TerminalState {
                 log::trace!("removed placement {} {:?}", image_id, placement_id);
                 self.kitty_remove_placement_from_model(image_id, placement_id, info);
             }
+            self.kitty_img
+                .virtual_placements
+                .remove(&(image_id, placement_id));
         } else {
             let mut to_clear = vec![];
             for (id, p) in self.kitty_img.placements.keys() {
@@ -327,6 +412,9 @@ impl TerminalState {
                     self.kitty_remove_placement_from_model(image_id, p, info);
                 }
             }
+            self.kitty_img
+                .virtual_placements
+                .retain(|&(id, _), _| id != image_id);
         }
 
         log::trace!(
@@ -341,6 +429,8 @@ impl TerminalState {
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
+        // Note: virtual placements are NOT cleared here.
+        // Per spec, d=a/A only affects placements with a physical screen location.
         if delete {
             self.kitty_img.id_to_data.clear();
             self.kitty_img.used_memory = 0;
