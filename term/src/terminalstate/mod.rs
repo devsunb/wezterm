@@ -32,6 +32,7 @@ mod kitty;
 mod mouse;
 pub(crate) mod performer;
 mod sixel;
+pub(crate) mod diacritics;
 use crate::terminalstate::image::*;
 use crate::terminalstate::kitty::*;
 
