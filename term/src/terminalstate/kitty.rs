@@ -10,12 +10,12 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use wezterm_cell::image::{ImageCell, ImageDataType};
+use wezterm_cell::image::{ImageCell, ImageDataType, PlayState};
 use wezterm_cell::Cell;
 use wezterm_escape_parser::apc::{
-    KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
-    KittyImageFormat, KittyImageFrame, KittyImageFrameCompose, KittyImagePlacement,
-    KittyImageTransmit, KittyImageVerbosity,
+    KittyFrameCompositionMode, KittyImage, KittyImageAnimationControl, KittyImageCompression,
+    KittyImageData, KittyImageDelete, KittyImageFormat, KittyImageFrame, KittyImageFrameCompose,
+    KittyImagePlacement, KittyImageTransmit, KittyImageVerbosity,
 };
 use wezterm_surface::change::ImageData;
 use wezterm_surface::TextureCoordinate;
@@ -587,13 +587,23 @@ impl TerminalState {
                 self.kitty_delete_placements_matching(delete, |info| info.z_index == z);
             }
             KittyImage::Delete {
-                what: KittyImageDelete::AnimationFrames { .. },
-                verbosity,
+                what:
+                    KittyImageDelete::AnimationFrames {
+                        image_id,
+                        image_number,
+                        frame_number,
+                        delete,
+                    },
+                ..
             } => {
-                log::warn!(
-                    "unhandled KittyImage::Delete AnimationFrames {:?}",
-                    verbosity
-                );
+                if let Err(err) =
+                    self.kitty_delete_animation_frames(image_id, image_number, frame_number, delete)
+                {
+                    log::error!(
+                        "Error {:#} while handling KittyImage::Delete AnimationFrames",
+                        err
+                    );
+                }
             }
             KittyImage::TransmitFrame {
                 transmit,
@@ -607,6 +617,14 @@ impl TerminalState {
             KittyImage::ComposeFrame { frame, verbosity } => {
                 if let Err(err) = self.kitty_frame_compose(frame, verbosity) {
                     log::error!("Error {:#} while handling KittyImage::ComposeFrame", err);
+                }
+            }
+            KittyImage::AnimationControl { control, verbosity } => {
+                if let Err(err) = self.kitty_animation_control(control, verbosity) {
+                    log::error!(
+                        "Error {:#} while handling KittyImage::AnimationControl",
+                        err
+                    );
                 }
             }
         };
@@ -1040,6 +1058,11 @@ impl TerminalState {
                             frames,
                             durations,
                             hashes,
+                            play_state: PlayState::default(),
+                            max_loops: 0,
+                            current_loop: 0,
+                            requested_frame: None,
+                            current_frame: 0,
                         };
                     }
                     Some(n) => anyhow::bail!(
@@ -1054,6 +1077,7 @@ impl TerminalState {
                 frames,
                 durations,
                 hashes,
+                ..
             } => {
                 let frame_no = frame.frame_number.unwrap_or(frames.len() as u32 + 1);
                 if frame_no == frames.len() as u32 + 1 {
@@ -1329,6 +1353,209 @@ fn clip_view(
     let mut tmp = RgbaImage::new(view_width, view_height);
     tmp.copy_from(&*view, 0, 0).context("copy source image")?;
     Ok(tmp)
+}
+
+impl TerminalState {
+    fn kitty_resolve_image_id(
+        &self,
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+    ) -> Option<u32> {
+        if let Some(no) = image_number {
+            if let Some(&id) = self.kitty_img.number_to_id.get(&no) {
+                return Some(id);
+            }
+        }
+        image_id
+    }
+
+    fn kitty_animation_control(
+        &mut self,
+        control: KittyImageAnimationControl,
+        verbosity: KittyImageVerbosity,
+    ) -> anyhow::Result<()> {
+        let image_id = match self.kitty_resolve_image_id(control.image_id, control.image_number) {
+            Some(id) => id,
+            None => {
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    control.image_id,
+                    control.image_number,
+                    "ENOENT".to_string(),
+                );
+                anyhow::bail!("no image_id or image_number for animation control");
+            }
+        };
+
+        let anim = match self.kitty_img.id_to_data.get(&image_id) {
+            Some(anim) => anim,
+            None => {
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    control.image_id,
+                    control.image_number,
+                    "ENOENT".to_string(),
+                );
+                anyhow::bail!("image id {} not found", image_id);
+            }
+        };
+
+        let mut anim = anim.data();
+        match &mut *anim {
+            ImageDataType::AnimRgba8 {
+                durations,
+                frames,
+                play_state,
+                max_loops,
+                current_loop,
+                requested_frame,
+                current_frame,
+                ..
+            } => {
+                if let Some(s) = control.state {
+                    *play_state = match s {
+                        1 => PlayState::Stopped,
+                        2 => PlayState::StopAfterLoop,
+                        3 => PlayState::Playing,
+                        _ => *play_state,
+                    };
+                }
+                if let Some(r) = control.target_frame {
+                    // r=0 means "don't change frame" per kitty spec.
+                    if r > 0 {
+                        let idx = (r - 1) as usize;
+                        if idx < frames.len() {
+                            *requested_frame = Some(r);
+                        }
+                    }
+                }
+                if let Some(z) = control.gap_ms {
+                    // Target frame for gap: use r if specified, else the
+                    // currently displayed frame (written by the renderer).
+                    let frame_idx = control
+                        .target_frame
+                        .map(|r| r.saturating_sub(1) as usize)
+                        .unwrap_or(*current_frame);
+                    if frame_idx < durations.len() {
+                        durations[frame_idx] = Duration::from_millis(z as u64);
+                    }
+                }
+                if let Some(v) = control.loops {
+                    // Kitty semantics: v=0 is a no-op (don't change loop count),
+                    // v=1 means infinite, v=N (N>1) means N-1 additional loops.
+                    // max_loops=0 is the infinite sentinel.
+                    if v > 0 {
+                        *max_loops = v - 1;
+                        *current_loop = 0;
+                    }
+                }
+            }
+            _ => {
+                drop(anim);
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    Some(image_id),
+                    control.image_number,
+                    "EINVAL:not an animated image".to_string(),
+                );
+                anyhow::bail!("animation control on non-animated image {}", image_id);
+            }
+        }
+
+        drop(anim);
+        self.kitty_send_response(
+            verbosity,
+            true,
+            Some(image_id),
+            control.image_number,
+            "OK".to_string(),
+        );
+
+        Ok(())
+    }
+
+    fn kitty_delete_animation_frames(
+        &mut self,
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        frame_number: Option<u32>,
+        delete: bool,
+    ) -> anyhow::Result<()> {
+        let image_id = self
+            .kitty_resolve_image_id(image_id, image_number)
+            .ok_or_else(|| anyhow::anyhow!("no image_id or image_number for frame deletion"))?;
+
+        let anim = match self.kitty_img.id_to_data.get(&image_id) {
+            Some(anim) => anim,
+            None => anyhow::bail!("image id {} not found", image_id),
+        };
+
+        let mut anim = anim.data();
+        match &mut *anim {
+            ImageDataType::AnimRgba8 {
+                frames,
+                durations,
+                hashes,
+                current_frame,
+                requested_frame,
+                ..
+            } => {
+                let total_frames = frames.len() as u32;
+                // Clamp frame_number to valid range; default to 1 (root frame).
+                let frame_num =
+                    frame_number.unwrap_or(1).max(1).min(total_frames);
+
+                // Single-frame image: d=F deletes the entire image, d=f is a no-op.
+                if total_frames <= 1 {
+                    if delete {
+                        drop(anim);
+                        self.kitty_remove_placement(image_id, None);
+                        self.kitty_img.remove_data_for_id(image_id);
+                    }
+                    return Ok(());
+                }
+
+                // Remove the specified frame (1-based -> 0-based index).
+                let remove_idx = (frame_num - 1) as usize;
+                frames.remove(remove_idx);
+                hashes.remove(remove_idx);
+                durations.remove(remove_idx);
+
+                // Adjust current_frame after removal.
+                if *current_frame >= frames.len() {
+                    *current_frame = frames.len().saturating_sub(1);
+                } else if remove_idx < *current_frame {
+                    *current_frame -= 1;
+                }
+                *requested_frame = None;
+
+                // d=F: if no extra frames remain after deletion, remove the image.
+                if delete && frames.len() <= 1 {
+                    drop(anim);
+                    self.kitty_remove_placement(image_id, None);
+                    self.kitty_img.remove_data_for_id(image_id);
+                }
+            }
+            _ => {
+                if delete {
+                    // d=F on non-animated image: delete the image entirely.
+                    drop(anim);
+                    self.kitty_remove_placement(image_id, None);
+                    self.kitty_img.remove_data_for_id(image_id);
+                } else {
+                    log::trace!(
+                        "delete animation frames on non-animated image {}",
+                        image_id
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 fn blit<D, S, P>(
