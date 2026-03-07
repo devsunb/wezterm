@@ -195,6 +195,20 @@ impl ImageCell {
 }
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayState {
+    Playing,
+    Stopped,
+    StopAfterLoop,
+}
+
+impl Default for PlayState {
+    fn default() -> Self {
+        Self::Playing
+    }
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq)]
 pub enum ImageDataType {
     /// Data is in the native image file format
@@ -225,6 +239,18 @@ pub enum ImageDataType {
         durations: Vec<Duration>,
         frames: Vec<Vec<u8>>,
         hashes: Vec<[u8; 32]>,
+        play_state: PlayState,
+        /// Maximum number of additional loops after the first play-through.
+        /// 0 = infinite. Mirrors kitty's `max_loops = v - 1`.
+        max_loops: u32,
+        /// How many loops have been completed so far.
+        current_loop: u32,
+        /// One-shot signal: jump to this 1-based frame index, then reset to None
+        requested_frame: Option<u32>,
+        /// The frame index currently being displayed (0-based).
+        /// Written by the rendering layer so that protocol handlers
+        /// (e.g., animation control z=N without r=N) can read it.
+        current_frame: usize,
     },
 }
 
@@ -254,6 +280,11 @@ impl std::fmt::Debug for ImageDataType {
                 height,
                 durations,
                 hashes,
+                play_state,
+                max_loops,
+                current_loop,
+                requested_frame,
+                current_frame,
             } => fmt
                 .debug_struct("AnimRgba8")
                 .field("frames_of_len", &frames.len())
@@ -261,6 +292,11 @@ impl std::fmt::Debug for ImageDataType {
                 .field("height", &height)
                 .field("durations", durations)
                 .field("hashes", hashes)
+                .field("play_state", play_state)
+                .field("max_loops", max_loops)
+                .field("current_loop", current_loop)
+                .field("requested_frame", requested_frame)
+                .field("current_frame", current_frame)
                 .finish(),
         }
     }
@@ -478,6 +514,11 @@ impl ImageDataType {
             frames,
             durations,
             hashes,
+            play_state: PlayState::default(),
+            max_loops: 0,
+            current_loop: 0,
+            requested_frame: None,
+            current_frame: 0,
         }
     }
 
