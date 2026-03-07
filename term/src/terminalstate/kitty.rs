@@ -493,6 +493,8 @@ impl TerminalState {
                     },
                 verbosity: _,
             } => {
+                // ID-based delete: removes both physical and virtual placements
+                // (unlike position-based deletes which skip virtual placements).
                 if let Some(&image_id) = self.kitty_img.number_to_id.get(&image_number) {
                     self.kitty_remove_placement(image_id, placement_id);
                     if delete {
@@ -510,7 +512,9 @@ impl TerminalState {
                     },
                 verbosity: _,
             } => {
-                let ids_in_range: Vec<u32> = self
+                // ID-based delete: removes both physical and virtual placements
+                // (unlike position-based deletes which skip virtual placements).
+                let ids_in_range: HashSet<u32> = self
                     .kitty_img
                     .id_to_data
                     .keys()
@@ -518,8 +522,6 @@ impl TerminalState {
                     .chain(self.kitty_img.placements.keys().map(|(id, _)| *id))
                     .chain(self.kitty_img.virtual_placements.keys().map(|(id, _)| *id))
                     .filter(|id| *id >= id_start && *id <= id_end)
-                    .collect::<HashSet<u32>>()
-                    .into_iter()
                     .collect();
                 for image_id in &ids_in_range {
                     self.kitty_remove_placement(*image_id, None);
@@ -533,8 +535,65 @@ impl TerminalState {
                         .retain(|_, id| !ids_in_range.contains(id));
                 }
             }
-            KittyImage::Delete { what, verbosity } => {
-                log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
+            KittyImage::Delete {
+                what: KittyImageDelete::AtCursorPosition { delete },
+                verbosity: _,
+            } => {
+                let col = self.cursor.x;
+                let row = self.screen().visible_row_to_stable_row(self.cursor.y);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row)
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteAt { x, y, delete },
+                verbosity: _,
+            } => {
+                // Kitty protocol uses 1-based coordinates for x= and y=.
+                let col = (x as usize).saturating_sub(1);
+                let row = self.screen().visible_row_to_stable_row(y as i64 - 1);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row)
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteAtZ { x, y, z, delete },
+                verbosity: _,
+            } => {
+                let col = (x as usize).saturating_sub(1);
+                let row = self.screen().visible_row_to_stable_row(y as i64 - 1);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row) && info.z_index == z
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteColumn { x, delete },
+                verbosity: _,
+            } => {
+                let col = (x as usize).saturating_sub(1);
+                self.kitty_delete_placements_matching(delete, |info| info.intersects_col(col));
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteRow { y, delete },
+                verbosity: _,
+            } => {
+                let row = self.screen().visible_row_to_stable_row(y as i64 - 1);
+                self.kitty_delete_placements_matching(delete, |info| info.intersects_row(row));
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteZ { z, delete },
+                verbosity: _,
+            } => {
+                self.kitty_delete_placements_matching(delete, |info| info.z_index == z);
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::AnimationFrames { .. },
+                verbosity,
+            } => {
+                log::warn!(
+                    "unhandled KittyImage::Delete AnimationFrames {:?}",
+                    verbosity
+                );
             }
             KittyImage::TransmitFrame {
                 transmit,
@@ -553,6 +612,46 @@ impl TerminalState {
         };
 
         Ok(())
+    }
+
+    /// Delete placements matching a position-based predicate (d=c/p/x/y/z/q).
+    /// Virtual placements are NOT affected because they have no screen
+    /// position -- only ID-based deletes (d=i/n/r) remove them, via
+    /// kitty_remove_placement().
+    fn kitty_delete_placements_matching(
+        &mut self,
+        delete_data: bool,
+        predicate: impl Fn(&PlacementInfo) -> bool,
+    ) {
+        let to_remove: Vec<((u32, Option<u32>), PlacementInfo)> = self
+            .kitty_img
+            .placements
+            .iter()
+            .filter(|(_, info)| predicate(info))
+            .map(|(&key, &info)| (key, info))
+            .collect();
+
+        let mut image_ids_to_delete = HashSet::new();
+        for ((image_id, placement_id), info) in to_remove {
+            self.kitty_img.placements.remove(&(image_id, placement_id));
+            self.kitty_remove_placement_from_model(image_id, placement_id, info);
+            if delete_data {
+                image_ids_to_delete.insert(image_id);
+            }
+        }
+
+        for image_id in image_ids_to_delete {
+            let has_remaining =
+                self.kitty_img.placements.keys().any(|(id, _)| *id == image_id)
+                    || self
+                        .kitty_img
+                        .virtual_placements
+                        .keys()
+                        .any(|(id, _)| *id == image_id);
+            if !has_remaining {
+                self.kitty_img.remove_data_for_id(image_id);
+            }
+        }
     }
 
     fn kitty_remove_placement_from_model(
@@ -613,9 +712,11 @@ impl TerminalState {
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
-        // Note: virtual placements are NOT cleared here.
-        // Per spec, d=a/A only affects placements with a physical screen location.
+        // d=a: remove physical placements only, keep data and virtual placements.
+        // d=A: remove everything including data; virtual placements become
+        // invalid without backing data, so clear them too.
         if delete {
+            self.kitty_img.virtual_placements.clear();
             self.kitty_img.id_to_data.clear();
             self.kitty_img.used_memory = 0;
             self.kitty_img.number_to_id.clear();
