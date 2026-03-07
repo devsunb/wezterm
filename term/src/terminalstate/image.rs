@@ -12,8 +12,27 @@ use wezterm_surface::TextureCoordinate;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
     pub first_row: StableRowIndex,
+    pub first_col: usize,
     pub rows: usize,
     pub cols: usize,
+    pub z_index: i32,
+}
+
+impl PlacementInfo {
+    pub fn intersects_cell(&self, col: usize, row: StableRowIndex) -> bool {
+        row >= self.first_row
+            && row < self.first_row + self.rows as StableRowIndex
+            && col >= self.first_col
+            && col < self.first_col + self.cols
+    }
+
+    pub fn intersects_col(&self, col: usize) -> bool {
+        col >= self.first_col && col < self.first_col + self.cols
+    }
+
+    pub fn intersects_row(&self, row: StableRowIndex) -> bool {
+        row >= self.first_row && row < self.first_row + self.rows as StableRowIndex
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -248,8 +267,10 @@ impl TerminalState {
 
         Ok(PlacementInfo {
             first_row,
+            first_col: cursor_x,
             rows: height_in_cells,
             cols: width_in_cells,
+            z_index: params.z_index,
         })
     }
 
