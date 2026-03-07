@@ -514,8 +514,61 @@ impl TerminalState {
                     }
                 }
             }
-            KittyImage::Delete { what, verbosity } => {
-                log::warn!("unhandled KittyImage::Delete {:?} {:?}", what, verbosity);
+            KittyImage::Delete {
+                what: KittyImageDelete::AtCursorPosition { delete },
+                verbosity: _,
+            } => {
+                let col = self.cursor.x;
+                let row = self.screen().visible_row_to_stable_row(self.cursor.y);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row)
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteAt { x, y, delete },
+                verbosity: _,
+            } => {
+                let col = x as usize;
+                let row = self.screen().visible_row_to_stable_row(y as i64);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row)
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteAtZ { x, y, z, delete },
+                verbosity: _,
+            } => {
+                let col = x as usize;
+                let row = self.screen().visible_row_to_stable_row(y as i64);
+                self.kitty_delete_placements_matching(delete, |info| {
+                    info.intersects_cell(col, row) && info.z_index == z
+                });
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteColumn { x, delete },
+                verbosity: _,
+            } => {
+                let col = x as usize;
+                self.kitty_delete_placements_matching(delete, |info| info.intersects_col(col));
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteRow { y, delete },
+                verbosity: _,
+            } => {
+                let row = self.screen().visible_row_to_stable_row(y as i64);
+                self.kitty_delete_placements_matching(delete, |info| info.intersects_row(row));
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::DeleteZ { z, delete },
+                verbosity: _,
+            } => {
+                self.kitty_delete_placements_matching(delete, |info| info.z_index == z);
+            }
+            KittyImage::Delete {
+                what: KittyImageDelete::AnimationFrames { .. },
+                verbosity,
+            } => {
+                log::warn!("unhandled KittyImage::Delete AnimationFrames {:?}", verbosity);
             }
             KittyImage::TransmitFrame {
                 transmit,
@@ -534,6 +587,36 @@ impl TerminalState {
         };
 
         Ok(())
+    }
+
+    /// Delete placements matching a predicate.
+    /// Virtual placements are NOT affected (per kitty spec).
+    fn kitty_delete_placements_matching(
+        &mut self,
+        delete_data: bool,
+        predicate: impl Fn(&PlacementInfo) -> bool,
+    ) {
+        let mut to_remove: Vec<(u32, Option<u32>, PlacementInfo)> = Vec::new();
+        self.kitty_img.placements.retain(|&(image_id, placement_id), info| {
+            if predicate(info) {
+                to_remove.push((image_id, placement_id, *info));
+                false
+            } else {
+                true
+            }
+        });
+
+        let mut image_ids_to_delete = std::collections::HashSet::new();
+        for (image_id, placement_id, info) in to_remove {
+            self.kitty_remove_placement_from_model(image_id, placement_id, info);
+            if delete_data {
+                image_ids_to_delete.insert(image_id);
+            }
+        }
+
+        for image_id in image_ids_to_delete {
+            self.kitty_img.remove_data_for_id(image_id);
+        }
     }
 
     fn kitty_remove_placement_from_model(

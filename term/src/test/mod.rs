@@ -1595,3 +1595,170 @@ fn test_kitty_unicode_placeholder_bottom_of_screen() {
     // It's acceptable if the off-screen row doesn't attach (scrolling complicates things)
     // but it must NOT crash
 }
+
+/// Test position-based delete modes (d=c, d=p, d=x, d=y, d=z, d=q).
+#[test]
+fn test_kitty_position_based_delete() {
+    use base64::Engine;
+
+    // 10 cols x 5 rows terminal, 8x16 pixel cells
+    let mut term = TestTerm::new_with_kitty(5, 10);
+
+    // Helper: transmit a 2x2 RGBA image and place it at the current cursor position.
+    // Returns the APC string for transmit+display (a=T).
+    let rgba_data = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba_data);
+
+    // Helper to check if a cell has an image
+    let has_image = |term: &TestTerm, col: usize, row: usize| -> bool {
+        let lines = term.screen().visible_lines();
+        lines
+            .get(row)
+            .and_then(|line| line.get_cell(col))
+            .map(|c| c.attrs().images().is_some())
+            .unwrap_or(false)
+    };
+
+    // --- Test d=c (delete at cursor position) ---
+    // Place image at (0,0) with id=1
+    term.print("\x1b[H"); // cursor to (0,0)
+    let place1 = format!("\x1b_Ga=T,i=1,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place1);
+    assert!(has_image(&term, 0, 0), "image should be at (0,0) after placement");
+
+    // Move cursor to (0,0) and delete at cursor
+    term.print("\x1b[H"); // cursor to (0,0)
+    term.print("\x1b_Ga=d,d=c,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 0, 0),
+        "image at (0,0) should be deleted by d=c"
+    );
+
+    // --- Test d=p (delete at specified x,y) ---
+    // Place image at (3,2) with id=2
+    term.print("\x1b[3;4H"); // cursor to row 2, col 3 (1-based: row 3, col 4)
+    let place2 = format!("\x1b_Ga=T,i=2,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place2);
+    assert!(has_image(&term, 3, 2), "image should be at (3,2) after placement");
+
+    // Delete at (3,2) using d=p with x=3,y=2 (0-based visible coords)
+    term.print("\x1b_Ga=d,d=p,x=3,y=2,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 3, 2),
+        "image at (3,2) should be deleted by d=p"
+    );
+
+    // --- Test d=x (delete at column) ---
+    // Place image at (5,0) with id=3
+    term.print("\x1b[1;6H"); // cursor to row 0, col 5
+    let place3 = format!("\x1b_Ga=T,i=3,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place3);
+    assert!(has_image(&term, 5, 0), "image should be at (5,0)");
+
+    // Delete all placements intersecting column 5
+    term.print("\x1b_Ga=d,d=x,x=5,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 5, 0),
+        "image at (5,0) should be deleted by d=x"
+    );
+
+    // --- Test d=y (delete at row) ---
+    // Place image at (0,3) with id=4
+    term.print("\x1b[4;1H"); // cursor to row 3, col 0
+    let place4 = format!("\x1b_Ga=T,i=4,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place4);
+    assert!(has_image(&term, 0, 3), "image should be at (0,3)");
+
+    // Delete all placements intersecting row 3
+    term.print("\x1b_Ga=d,d=y,y=3,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 0, 3),
+        "image at (0,3) should be deleted by d=y"
+    );
+
+    // --- Test d=z (delete by z-index) ---
+    // Place image at (0,0) with id=5, z_index=7
+    term.print("\x1b[H");
+    let place5 = format!("\x1b_Ga=T,i=5,f=32,s=2,v=2,z=7,q=2;{}\x1b\\", b64);
+    term.print(&place5);
+    assert!(has_image(&term, 0, 0), "image should be at (0,0) with z=7");
+
+    // Delete all placements with z-index=7
+    term.print("\x1b_Ga=d,d=z,z=7,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 0, 0),
+        "image with z=7 should be deleted by d=z"
+    );
+
+    // --- Test d=q (delete at x,y with z-index) ---
+    // Place two images at same position but different z-index
+    term.print("\x1b[H");
+    let place6 = format!("\x1b_Ga=T,i=6,f=32,s=2,v=2,z=10,q=2;{}\x1b\\", b64);
+    term.print(&place6);
+    term.print("\x1b[H");
+    let place7 = format!("\x1b_Ga=T,i=7,f=32,s=2,v=2,z=20,q=2;{}\x1b\\", b64);
+    term.print(&place7);
+    assert!(has_image(&term, 0, 0), "images should be at (0,0)");
+
+    // Delete only z=10 at (0,0) -- image with z=20 should remain
+    term.print("\x1b_Ga=d,d=q,x=0,y=0,z=10,q=2\x1b\\");
+    // Cell should still have an image (the z=20 one)
+    assert!(
+        has_image(&term, 0, 0),
+        "image with z=20 should still be at (0,0) after d=q,z=10"
+    );
+
+    // Now delete z=20 at (0,0)
+    term.print("\x1b_Ga=d,d=q,x=0,y=0,z=20,q=2\x1b\\");
+    assert!(
+        !has_image(&term, 0, 0),
+        "all images at (0,0) should be deleted after d=q,z=20"
+    );
+}
+
+/// Virtual placements (U=1) must NOT be affected by position-based deletes.
+#[test]
+fn test_kitty_position_delete_skips_virtual_placements() {
+    use base64::Engine;
+
+    let mut term = TestTerm::new_with_kitty(5, 10);
+
+    let rgba_data = vec![255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba_data);
+
+    // Transmit image
+    let transmit = format!("\x1b_Ga=t,i=1,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&transmit);
+
+    // Create virtual placement (U=1)
+    term.print("\x1b_Ga=p,U=1,i=1,c=2,r=1,q=2\x1b\\");
+
+    // Place unicode placeholders at (0,0)
+    let placeholder =
+        format!("\x1b[38;2;0;0;1m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\x1b[0m");
+    term.print(&placeholder);
+
+    // Verify images are placed
+    let lines = term.screen().visible_lines();
+    assert!(
+        lines[0].get_cell(0).unwrap().attrs().images().is_some(),
+        "virtual placement should be at (0,0)"
+    );
+
+    // Try d=c at (0,0) - should NOT remove virtual placements from the store
+    term.print("\x1b[H");
+    term.print("\x1b_Ga=d,d=c,q=2\x1b\\");
+
+    // The virtual placement record should still exist so future placeholder
+    // chars can still resolve it. We verify by printing new placeholder chars.
+    term.print("\x1b[2;1H"); // row 1, col 0
+    let placeholder2 =
+        format!("\x1b[38;2;0;0;1m\u{10EEEE}\u{0305}\u{0305}\u{10EEEE}\u{0305}\u{030D}\x1b[0m");
+    term.print(&placeholder2);
+
+    let lines = term.screen().visible_lines();
+    assert!(
+        lines[1].get_cell(0).unwrap().attrs().images().is_some(),
+        "virtual placement should still work after position-based delete"
+    );
+}
