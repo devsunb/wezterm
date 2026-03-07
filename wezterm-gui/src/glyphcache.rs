@@ -23,7 +23,7 @@ use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryR
 use std::sync::{Arc, LazyLock, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
-use termwiz::image::{ImageData, ImageDataType};
+use termwiz::image::{ImageData, ImageDataType, PlayState};
 use termwiz::surface::CursorShape;
 use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
 use wezterm_font::units::*;
@@ -914,6 +914,66 @@ impl GlyphCache {
             _ => None,
         };
 
+        // Advance animation frame if needed (requires mutable access for play_state/loops)
+        if let ImageDataType::AnimRgba8 {
+            frames,
+            durations,
+            play_state,
+            loops,
+            requested_frame,
+            ..
+        } = &mut *handle.h
+        {
+            // Handle one-shot frame jump request from animation control (r=N)
+            if let Some(r) = requested_frame.take() {
+                let idx = r.saturating_sub(1) as usize;
+                if idx < frames.len() {
+                    let mut decoded_current_frame = decoded.current_frame.borrow_mut();
+                    *decoded_current_frame = idx;
+                    *decoded.frame_start.borrow_mut() = Instant::now();
+                    handle.current_frame = idx;
+                }
+            }
+
+            let is_playing = *play_state != PlayState::Stopped;
+            if frames.len() > 1 && is_playing {
+                let now = Instant::now();
+                let mut decoded_frame_start = decoded.frame_start.borrow_mut();
+                let mut decoded_current_frame = decoded.current_frame.borrow_mut();
+                let next_due = *decoded_frame_start
+                    + durations[*decoded_current_frame].max(min_frame_duration);
+                if now >= next_due {
+                    if *play_state == PlayState::StopAfterFrame {
+                        *play_state = PlayState::Stopped;
+                    } else {
+                        *decoded_current_frame = *decoded_current_frame + 1;
+                        if *decoded_current_frame >= frames.len() {
+                            if *loops > 0 {
+                                *loops = loops.saturating_sub(1);
+                                if *loops == 0 {
+                                    // Stop at the last frame when all loops are exhausted
+                                    *play_state = PlayState::Stopped;
+                                    *decoded_current_frame = frames.len() - 1;
+                                } else {
+                                    *decoded_current_frame = 0;
+                                }
+                            } else {
+                                *decoded_current_frame = 0;
+                            }
+                            if *decoded_current_frame == 0
+                                && durations[0].as_millis() == 0
+                                && frames.len() > 1
+                            {
+                                *decoded_current_frame = *decoded_current_frame + 1;
+                            }
+                        }
+                        *decoded_frame_start = now;
+                        handle.current_frame = *decoded_current_frame;
+                    }
+                }
+            }
+        }
+
         match &*handle.h {
             ImageDataType::Rgba8 { hash, .. } => {
                 if let Some(sprite) = frame_cache.get(hash) {
@@ -928,48 +988,22 @@ impl GlyphCache {
             }
             ImageDataType::AnimRgba8 {
                 hashes,
-                frames,
                 durations,
+                play_state,
                 ..
             } => {
-                let mut next = None;
-                let mut decoded_frame_start = decoded.frame_start.borrow_mut();
-                let mut decoded_current_frame = decoded.current_frame.borrow_mut();
-                if frames.len() > 1 {
-                    let now = Instant::now();
-
-                    // We round up the frame duration to at least the minimum
-                    // frame duration that wezterm can use when rendering.
-                    // There's no point trying to deal with smaller intervals
-                    // because we simply cannot render them without dropping
-                    // frames.
-                    // In addition, with a 1ms frame delay, there's a good chance
-                    // that any given cell may switch to a different frame from
-                    // its neighbor while we are rendering the entire terminal
-                    // frame, so we want to avoid that.
-                    // <https://github.com/wezterm/wezterm/issues/3260>
-                    let mut next_due = *decoded_frame_start
-                        + durations[*decoded_current_frame].max(min_frame_duration);
-                    if now >= next_due {
-                        // Advance to next frame
-                        *decoded_current_frame = *decoded_current_frame + 1;
-                        if *decoded_current_frame >= frames.len() {
-                            *decoded_current_frame = 0;
-                            // Skip potential 0-duration root frame
-                            if durations[0].as_millis() == 0 && frames.len() > 1 {
-                                *decoded_current_frame = *decoded_current_frame + 1;
-                            }
-                        }
-                        *decoded_frame_start = now;
-                        next_due = *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration);
-                        handle.current_frame = *decoded_current_frame;
-                    }
-
-                    next.replace(next_due);
-                }
-
+                let decoded_frame_start = decoded.frame_start.borrow();
+                let decoded_current_frame = decoded.current_frame.borrow();
                 let hash = hashes[*decoded_current_frame];
+
+                let next = if *play_state != PlayState::Stopped {
+                    Some(
+                        *decoded_frame_start
+                            + durations[*decoded_current_frame].max(min_frame_duration),
+                    )
+                } else {
+                    None
+                };
 
                 if let Some(sprite) = frame_cache.get(&hash) {
                     return Ok((sprite.clone(), next, LoadState::Loaded));
@@ -981,14 +1015,7 @@ impl GlyphCache {
 
                 frame_cache.insert(hash, sprite.clone());
 
-                return Ok((
-                    sprite,
-                    Some(
-                        *decoded_frame_start
-                            + durations[*decoded_current_frame].max(min_frame_duration),
-                    ),
-                    LoadState::Loaded,
-                ));
+                return Ok((sprite, next, LoadState::Loaded));
             }
             ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => {
                 let mut frames = decoded.frames.borrow_mut();

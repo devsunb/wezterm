@@ -697,7 +697,11 @@ pub enum KittyImageDelete {
 
     /// d='f' or d='F'
     /// Delete animation frames
-    AnimationFrames { delete: bool },
+    AnimationFrames {
+        image_id: Option<u32>,
+        image_number: Option<u32>,
+        delete: bool,
+    },
 
     /// d='p' or d='P'
     /// Delete all placements that intersect the specified
@@ -756,7 +760,11 @@ impl KittyImageDelete {
                 delete,
             }),
             'c' | 'C' => Some(Self::AtCursorPosition { delete }),
-            'f' | 'F' => Some(Self::AnimationFrames { delete }),
+            'f' | 'F' => Some(Self::AnimationFrames {
+                image_id: geti(keys, "i"),
+                image_number: geti(keys, "I"),
+                delete,
+            }),
             'p' | 'P' => Some(Self::DeleteAt {
                 x: geti(keys, "x")?,
                 y: geti(keys, "y")?,
@@ -823,8 +831,14 @@ impl KittyImageDelete {
             Self::AtCursorPosition { delete } => {
                 keys.insert("d", d('c', delete));
             }
-            Self::AnimationFrames { delete } => {
+            Self::AnimationFrames {
+                image_id,
+                image_number,
+                delete,
+            } => {
                 keys.insert("d", d('f', delete));
+                set(keys, "i", image_id);
+                set(keys, "I", image_number);
             }
             Self::DeleteAt { x, y, delete } => {
                 keys.insert("d", d('p', delete));
@@ -1040,6 +1054,44 @@ impl KittyImageFrame {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImageAnimationControl {
+    /// i=...
+    pub image_id: Option<u32>,
+    /// I=...
+    pub image_number: Option<u32>,
+    /// s=1: stop, s=2: run current frame then stop, s=3: run animation
+    pub state: Option<u32>,
+    /// r=N: set current frame to N (1-based)
+    pub current_frame: Option<u32>,
+    /// z=N: set gap (ms) between current frame and next frame
+    pub gap_ms: Option<u32>,
+    /// v=N: loop count (0=infinite)
+    pub loops: Option<u32>,
+}
+
+impl KittyImageAnimationControl {
+    fn from_keys(keys: &BTreeMap<&str, &str>) -> Option<Self> {
+        Some(Self {
+            image_id: geti(keys, "i"),
+            image_number: geti(keys, "I"),
+            state: geti(keys, "s"),
+            current_frame: geti(keys, "r"),
+            gap_ms: geti(keys, "z"),
+            loops: geti(keys, "v"),
+        })
+    }
+
+    fn to_keys(&self, keys: &mut BTreeMap<&'static str, String>) {
+        set(keys, "i", &self.image_id);
+        set(keys, "I", &self.image_number);
+        set(keys, "s", &self.state);
+        set(keys, "r", &self.current_frame);
+        set(keys, "z", &self.gap_ms);
+        set(keys, "v", &self.loops);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KittyImage {
     /// a='t'
     TransmitData {
@@ -1077,6 +1129,11 @@ pub enum KittyImage {
         frame: KittyImageFrameCompose,
         verbosity: KittyImageVerbosity,
     },
+    /// a='a'
+    AnimationControl {
+        control: KittyImageAnimationControl,
+        verbosity: KittyImageVerbosity,
+    },
 }
 
 impl KittyImage {
@@ -1089,6 +1146,7 @@ impl KittyImage {
             Self::Delete { verbosity, .. } => *verbosity,
             Self::TransmitFrame { verbosity, .. } => *verbosity,
             Self::ComposeFrame { verbosity, .. } => *verbosity,
+            Self::AnimationControl { verbosity, .. } => *verbosity,
         }
     }
 
@@ -1140,6 +1198,10 @@ impl KittyImage {
             }),
             "c" => Some(Self::ComposeFrame {
                 frame: KittyImageFrameCompose::from_keys(&keys)?,
+                verbosity,
+            }),
+            "a" => Some(Self::AnimationControl {
+                control: KittyImageAnimationControl::from_keys(&keys)?,
                 verbosity,
             }),
             _ => None,
@@ -1204,6 +1266,11 @@ impl KittyImage {
             Self::ComposeFrame { frame, verbosity } => {
                 keys.insert("a", "c".to_string());
                 frame.to_keys(keys);
+                verbosity.to_keys(keys);
+            }
+            Self::AnimationControl { control, verbosity } => {
+                keys.insert("a", "a".to_string());
+                control.to_keys(keys);
                 verbosity.to_keys(keys);
             }
         }

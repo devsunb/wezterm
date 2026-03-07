@@ -195,6 +195,20 @@ impl ImageCell {
 }
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayState {
+    Playing,
+    Stopped,
+    StopAfterFrame,
+}
+
+impl Default for PlayState {
+    fn default() -> Self {
+        Self::Playing
+    }
+}
+
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Eq)]
 pub enum ImageDataType {
     /// Data is in the native image file format
@@ -225,6 +239,10 @@ pub enum ImageDataType {
         durations: Vec<Duration>,
         frames: Vec<Vec<u8>>,
         hashes: Vec<[u8; 32]>,
+        play_state: PlayState,
+        loops: u32,
+        /// One-shot signal: jump to this 1-based frame index, then reset to None
+        requested_frame: Option<u32>,
     },
 }
 
@@ -254,6 +272,9 @@ impl std::fmt::Debug for ImageDataType {
                 height,
                 durations,
                 hashes,
+                play_state,
+                loops,
+                requested_frame,
             } => fmt
                 .debug_struct("AnimRgba8")
                 .field("frames_of_len", &frames.len())
@@ -261,6 +282,9 @@ impl std::fmt::Debug for ImageDataType {
                 .field("height", &height)
                 .field("durations", durations)
                 .field("hashes", hashes)
+                .field("play_state", play_state)
+                .field("loops", loops)
+                .field("requested_frame", requested_frame)
                 .finish(),
         }
     }
@@ -478,6 +502,9 @@ impl ImageDataType {
             frames,
             durations,
             hashes,
+            play_state: PlayState::default(),
+            loops: 0,
+            requested_frame: None,
         }
     }
 
