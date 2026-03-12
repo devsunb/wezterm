@@ -393,6 +393,34 @@ pub struct TerminalState {
     /// applied to lines.
     /// If none, then the default value specified by the config is used.
     bidi_hint: Option<ParagraphDirectionHint>,
+
+    /// Kitty unicode placeholder run tracking state.
+    /// Persisted across flush_print() calls so that runs broken
+    /// by mid-row SGR sequences can continue correctly.
+    placeholder_run: PlaceholderRunState,
+}
+
+/// Tracks the state of a kitty unicode placeholder run across
+/// flush_print() calls. When neovim sends SGR escapes mid-row,
+/// flush_print() is called multiple times for the same row.
+/// Without persisted state, the new run would lose column info.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct PlaceholderRunState {
+    pub fg_id: u32,
+    pub ul_id: u32,
+    pub img_row: u32,
+    pub img_col: u32,
+    pub img_msb: u32,
+    pub length: usize,
+    pub screen_x: usize,
+    pub screen_y: i64,
+    pub col_start: u32,
+    /// Screen X position one past the last cell of this run.
+    /// Used to verify physical adjacency across flush_print() boundaries.
+    pub screen_end_x: usize,
+    /// True after a run has been flushed but may still be continued
+    /// by the next flush_print() call (e.g., after an SGR escape).
+    pub continuable: bool,
 }
 
 #[derive(Debug)]
@@ -582,6 +610,7 @@ impl TerminalState {
             bidi_enabled: None,
             bidi_hint: None,
             progress: Progress::default(),
+            placeholder_run: PlaceholderRunState::default(),
         }
     }
 

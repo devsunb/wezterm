@@ -5,20 +5,22 @@ use ::image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, RgbImage, Rgba, RgbaImage,
 };
 use anyhow::Context;
+use ordered_float::NotNan;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
-use wezterm_cell::image::ImageDataType;
+use wezterm_cell::image::{ImageCell, ImageDataType};
+use wezterm_cell::Cell;
 use wezterm_escape_parser::apc::{
     KittyFrameCompositionMode, KittyImage, KittyImageCompression, KittyImageData, KittyImageDelete,
     KittyImageFormat, KittyImageFrame, KittyImageFrameCompose, KittyImagePlacement,
     KittyImageTransmit, KittyImageVerbosity,
 };
 use wezterm_surface::change::ImageData;
+use wezterm_surface::TextureCoordinate;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct VirtualPlacement {
     pub columns: Option<u32>,
     pub rows: Option<u32>,
@@ -202,6 +204,160 @@ impl TerminalState {
             image_number,
             placement.placement_id
         );
+
+        Ok(())
+    }
+
+    /// Place a run of unicode placeholder cells for a kitty image.
+    /// Directly computes texture coordinates and attaches ImageCell
+    /// to each cell in the run, bypassing assign_image_to_cells().
+    pub(crate) fn kitty_img_place_run(
+        &mut self,
+        image_id: u32,
+        placement_id: Option<u32>,
+        img_col: u32,
+        img_row: u32,
+        run_length: usize,
+    ) -> anyhow::Result<()> {
+        let img = Arc::clone(
+            self.kitty_img
+                .id_to_data
+                .get(&image_id)
+                .ok_or_else(|| anyhow::anyhow!("no image data for id {}", image_id))?,
+        );
+
+        // Look up the exact (image_id, placement_id) first, then fall back
+        // to any virtual placement matching the image_id (per kitty spec:
+        // "if placement_id is not specified, use any available virtual placement").
+        let vp = self
+            .kitty_img
+            .virtual_placements
+            .get(&(image_id, placement_id))
+            .or_else(|| {
+                // Fall back to any virtual placement for this image_id.
+                // Use the one with the smallest placement_id for determinism
+                // (HashMap iteration order is arbitrary).
+                self.kitty_img
+                    .virtual_placements
+                    .iter()
+                    .filter(|(&(id, _), _)| id == image_id)
+                    .min_by_key(|(&(_, pid), _)| pid)
+                    .map(|(_, v)| v)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no virtual placement for image_id={} placement_id={:?}",
+                    image_id,
+                    placement_id
+                )
+            })?;
+
+        let z_index = vp.z_index.unwrap_or(0);
+        // Read dimensions from the actual image data rather than the cached
+        // values in VirtualPlacement, which can become stale if the image
+        // is re-transmitted with different dimensions.
+        let (image_width, image_height) = img
+            .data()
+            .dimensions()
+            .unwrap_or((vp.image_width, vp.image_height));
+        if image_width == 0 || image_height == 0 {
+            return Ok(());
+        }
+        // Total grid size in cells as declared by the virtual placement.
+        // If not specified, fall back to image pixels / cell pixels.
+        let physical_cols = self.screen().physical_cols;
+        let physical_rows = self.screen().physical_rows;
+        let cell_pixel_width = (self.pixel_width / physical_cols.max(1)).max(1);
+        let cell_pixel_height = (self.pixel_height / physical_rows.max(1)).max(1);
+
+        // Source rectangle within the image (default: entire image)
+        let src_x = vp.src_x.unwrap_or(0) as f32;
+        let src_y = vp.src_y.unwrap_or(0) as f32;
+        let src_w = vp
+            .src_w
+            .map(|w| w as f32)
+            .unwrap_or((image_width as f32 - src_x).max(0.0));
+        let src_h = vp
+            .src_h
+            .map(|h| h as f32)
+            .unwrap_or((image_height as f32 - src_y).max(0.0));
+
+        let total_cols = vp
+            .columns
+            .map(|c| c as usize)
+            .unwrap_or_else(|| (src_w as usize + cell_pixel_width - 1) / cell_pixel_width);
+        let total_rows = vp
+            .rows
+            .map(|r| r as usize)
+            .unwrap_or_else(|| (src_h as usize + cell_pixel_height - 1) / cell_pixel_height);
+
+        if total_cols == 0 || total_rows == 0 {
+            return Ok(());
+        }
+
+        // Texture coordinate bounds for the source rectangle
+        let tex_x0 = src_x / image_width as f32;
+        let tex_y0 = src_y / image_height as f32;
+        let tex_w = src_w / image_width as f32;
+        let tex_h = src_h / image_height as f32;
+
+        let seqno = self.seqno;
+        let cursor_x = self.cursor.x;
+        let cursor_y = self.cursor.y;
+
+        // Diacritic values are 1-based (U+0305=1, U+030D=2, ...);
+        // 0 means "not specified". Default unspecified columns to 1
+        // (first column), matching kitty's behavior.
+        let effective_img_col = if img_col == 0 { 1 } else { img_col };
+
+        for i in 0..run_length {
+            // Convert 1-based diacritic values to 0-based texture indices.
+            let col = effective_img_col.saturating_sub(1) as usize + i;
+            let row = img_row.saturating_sub(1) as usize;
+
+            // Texture coordinates: map cell grid position within source rect
+            let x_left = tex_x0 + tex_w * (col as f32 / total_cols as f32);
+            let x_right = tex_x0 + tex_w * ((col + 1) as f32 / total_cols as f32);
+            let y_top = tex_y0 + tex_h * (row as f32 / total_rows as f32);
+            let y_bottom = tex_y0 + tex_h * ((row + 1) as f32 / total_rows as f32);
+
+            let tl = TextureCoordinate::new(
+                NotNan::new(x_left).unwrap_or_default(),
+                NotNan::new(y_top).unwrap_or_default(),
+            );
+            let br = TextureCoordinate::new(
+                NotNan::new(x_right).unwrap_or_default(),
+                NotNan::new(y_bottom).unwrap_or_default(),
+            );
+
+            let cell_x = cursor_x + i;
+            let mut cell = self
+                .screen_mut()
+                .get_cell(cell_x, cursor_y)
+                .cloned()
+                .unwrap_or_else(Cell::blank);
+
+            // Remove any existing image for the same image_id before attaching.
+            // Without this, repeated writes (neovim's multi-pass redraw) accumulate
+            // duplicate ImageCells with potentially stale texture coordinates.
+            cell.attrs_mut()
+                .detach_image_with_placement(image_id, placement_id);
+
+            let img_cell = Box::new(ImageCell::with_z_index(
+                tl,
+                br,
+                img.clone(),
+                z_index,
+                0,
+                0,
+                0,
+                0,
+                Some(image_id),
+                placement_id,
+            ));
+            cell.attrs_mut().attach_image(img_cell);
+            self.screen_mut().set_cell(cell_x, cursor_y, &cell, seqno);
+        }
 
         Ok(())
     }
