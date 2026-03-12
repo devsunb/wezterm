@@ -1,4 +1,5 @@
 use crate::terminal::{Alert, Progress};
+use crate::terminalstate::diacritics::diacritic_to_num;
 use crate::terminalstate::{
     default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
 };
@@ -14,6 +15,7 @@ use termwiz::input::KeyboardEncoding;
 use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 use url::Url;
 use wezterm_bidi::ParagraphDirectionHint;
+use wezterm_cell::color::ColorAttribute;
 use wezterm_cell::{
     grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
 };
@@ -27,6 +29,23 @@ use wezterm_escape_parser::osc::{
 use wezterm_escape_parser::{
     Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
 };
+
+/// Extracts the lower 24 bits of an image/placement ID from a color attribute.
+/// Uses rounding (+ 0.5) to avoid float truncation errors from the
+/// u8 -> f32 -> u8 round-trip in SrgbaTuple.
+fn color_to_id(color: &ColorAttribute) -> u32 {
+    match color {
+        ColorAttribute::TrueColorWithDefaultFallback(c)
+        | ColorAttribute::TrueColorWithPaletteFallback(c, _) => {
+            let r = (c.0 * 255.0 + 0.5) as u32;
+            let g = (c.1 * 255.0 + 0.5) as u32;
+            let b = (c.2 * 255.0 + 0.5) as u32;
+            (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
+        }
+        ColorAttribute::PaletteIndex(idx) => *idx as u32,
+        ColorAttribute::Default => 0,
+    }
+}
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
 /// the terminal state and the embedding/host terminal interface
@@ -112,6 +131,38 @@ impl<'a> Performer<'a> {
         } else {
             g
         }
+    }
+
+    fn flush_placeholder_run(
+        &mut self,
+        fg_id: u32,
+        ul_id: u32,
+        img_msb: u32,
+        img_col_start: u32,
+        img_row: u32,
+        run_length: usize,
+        screen_x: usize,
+        screen_y: i64,
+    ) {
+        // Diacritic values are 0-based: 0 = auto/first, 1 = second, 2 = third, etc.
+        let image_id = fg_id | (img_msb << 24);
+        let placement_id = if ul_id == 0 { None } else { Some(ul_id) };
+        // Temporarily move cursor to the run's start position
+        let saved_x = self.cursor.x;
+        let saved_y = self.cursor.y;
+        self.cursor.x = screen_x;
+        self.cursor.y = screen_y;
+        if let Err(e) = self.state.kitty_img_place_run(
+            image_id,
+            placement_id,
+            img_col_start,
+            img_row,
+            run_length,
+        ) {
+            log::warn!("placeholder run: {:#}", e);
+        }
+        self.cursor.x = saved_x;
+        self.cursor.y = saved_y;
     }
 
     fn flush_print(&mut self) {
@@ -210,18 +261,147 @@ impl<'a> Performer<'a> {
                 }
             }
 
-            // Assign the cell
-            log::trace!(
-                "print x={} y={} print_width={} width={} cell={} {:?}",
-                x,
-                y,
-                print_width,
-                width,
-                g,
-                self.pen
-            );
-            self.screen_mut()
-                .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            // Check for image placeholder character
+            if g.starts_with('\u{10EEEE}') {
+                // Decode diacritics as Options to distinguish absent from explicit 0.
+                let mut chars = g.chars();
+                chars.next(); // skip U+10EEEE
+                let diac1_opt = chars.next().map(diacritic_to_num);
+                let diac2_opt = chars.next().map(diacritic_to_num);
+                let diac3_opt = chars.next().map(diacritic_to_num);
+
+                // When ALL diacritics are absent (pass 1 of neovim's multi-pass
+                // redraw), skip entirely -- don't write to the cell and don't
+                // create an image run. Just advance the cursor. This preserves
+                // any existing image data on the cell. The actual image data
+                // will arrive in later passes with explicit row/col diacritics.
+                // Without this, pass 1 would place row=0 image data, and if a
+                // scroll happens before pass 2/3, the cell retains stale row=0.
+                if diac1_opt.is_none() {
+                    if !wrappable {
+                        self.cursor.x += print_width;
+                        self.wrap_next = false;
+                    } else {
+                        self.wrap_next = self.dec_auto_wrap;
+                    }
+                    continue;
+                }
+
+                let diac1 = diac1_opt.unwrap_or(0);
+                let diac2 = diac2_opt.unwrap_or(0);
+                let diac3 = diac3_opt.unwrap_or(0);
+
+                // Decode IDs from colors
+                let fg_id = color_to_id(&pen.foreground());
+                let ul_id = color_to_id(&pen.underline_color());
+
+                // Check run continuity.
+                // Diacritic value 0 (U+0305) means "auto/not specified" per the
+                // kitty spec; treat it as continuing the current run's value.
+                // The fg_id check prevents cross-image merging.
+                // Also check `continuable` to continue runs across flush_print()
+                // boundaries (e.g., when SGR escapes split a row mid-run).
+                let run = &self.placeholder_run;
+                let continues_run = (run.length > 0 || run.continuable)
+                    && fg_id == run.fg_id
+                    && ul_id == run.ul_id
+                    && (diac1 == 0 || diac1 == run.img_row)
+                    && (diac2 == 0 || diac2 == run.img_col + 1)
+                    && (diac3 == 0 || diac3 == run.img_msb)
+                    && y == run.screen_y;
+
+                if continues_run && self.placeholder_run.continuable {
+                    // Resuming a previously flushed run in a new flush_print call.
+                    // Start a new sub-run but with correct column tracking.
+                    let prev_col = self.placeholder_run.img_col;
+                    let new_col = if diac2 != 0 { diac2 } else { prev_col + 1 };
+                    self.placeholder_run.continuable = false;
+                    self.placeholder_run.screen_x = x;
+                    self.placeholder_run.length = 1;
+                    self.placeholder_run.col_start = new_col;
+                    self.placeholder_run.img_col = new_col;
+                    if diac1 != 0 {
+                        self.placeholder_run.img_row = diac1;
+                    }
+                    if diac3 != 0 {
+                        self.placeholder_run.img_msb = diac3;
+                    }
+                } else if continues_run {
+                    self.placeholder_run.length += 1;
+                    if diac2 != 0 {
+                        self.placeholder_run.img_col = diac2;
+                    } else {
+                        self.placeholder_run.img_col += 1;
+                    }
+                    if diac1 != 0 {
+                        self.placeholder_run.img_row = diac1;
+                    }
+                    if diac3 != 0 {
+                        self.placeholder_run.img_msb = diac3;
+                    }
+                } else {
+                    // Flush previous run if any
+                    if self.placeholder_run.length > 0 {
+                        let (fg, ul, msb, cs, row, len, sx, sy) = (
+                            self.placeholder_run.fg_id,
+                            self.placeholder_run.ul_id,
+                            self.placeholder_run.img_msb,
+                            self.placeholder_run.col_start,
+                            self.placeholder_run.img_row,
+                            self.placeholder_run.length,
+                            self.placeholder_run.screen_x,
+                            self.placeholder_run.screen_y,
+                        );
+                        self.flush_placeholder_run(fg, ul, msb, cs, row, len, sx, sy);
+                    }
+
+                    // Start new run
+                    self.placeholder_run.img_row = diac1;
+                    self.placeholder_run.img_col = diac2;
+                    self.placeholder_run.img_msb = diac3;
+                    self.placeholder_run.col_start = diac2;
+                    self.placeholder_run.fg_id = fg_id;
+                    self.placeholder_run.ul_id = ul_id;
+                    self.placeholder_run.screen_x = x;
+                    self.placeholder_run.screen_y = y;
+                    self.placeholder_run.length = 1;
+                    self.placeholder_run.continuable = false;
+                }
+
+                // Write a space to the cell (image will overlay)
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, " ", print_width, pen, seqno);
+            } else {
+                // Flush any pending placeholder run before normal text
+                if self.placeholder_run.length > 0 {
+                    let (fg, ul, msb, cs, row, len, sx, sy) = (
+                        self.placeholder_run.fg_id,
+                        self.placeholder_run.ul_id,
+                        self.placeholder_run.img_msb,
+                        self.placeholder_run.col_start,
+                        self.placeholder_run.img_row,
+                        self.placeholder_run.length,
+                        self.placeholder_run.screen_x,
+                        self.placeholder_run.screen_y,
+                    );
+                    self.flush_placeholder_run(fg, ul, msb, cs, row, len, sx, sy);
+                    self.placeholder_run.length = 0;
+                    self.placeholder_run.continuable = false;
+                }
+
+                // Normal cell assignment
+                log::trace!(
+                    "print x={} y={} print_width={} width={} cell={} {:?}",
+                    x,
+                    y,
+                    print_width,
+                    width,
+                    g,
+                    self.pen
+                );
+                self.screen_mut()
+                    .set_cell_grapheme(x, y, g, print_width, pen, seqno);
+            }
 
             if !wrappable {
                 self.cursor.x += print_width;
@@ -229,6 +409,25 @@ impl<'a> Performer<'a> {
             } else {
                 self.wrap_next = self.dec_auto_wrap;
             }
+        }
+
+        // Flush final placeholder run, but mark as continuable so the
+        // next flush_print() can resume if the run continues after an
+        // SGR or other attribute-only escape sequence.
+        if self.placeholder_run.length > 0 {
+            let (fg, ul, msb, cs, row, len, sx, sy) = (
+                self.placeholder_run.fg_id,
+                self.placeholder_run.ul_id,
+                self.placeholder_run.img_msb,
+                self.placeholder_run.col_start,
+                self.placeholder_run.img_row,
+                self.placeholder_run.length,
+                self.placeholder_run.screen_x,
+                self.placeholder_run.screen_y,
+            );
+            self.flush_placeholder_run(fg, ul, msb, cs, row, len, sx, sy);
+            self.placeholder_run.length = 0;
+            self.placeholder_run.continuable = true;
         }
 
         std::mem::swap(&mut self.print, &mut p);
@@ -280,6 +479,7 @@ impl<'a> Performer<'a> {
             Action::XtGetTcap(names) => self.xt_get_tcap(names),
             Action::KittyImage(img) => {
                 self.flush_print();
+                self.placeholder_run.continuable = false;
                 if let Err(err) = self.kitty_img(*img) {
                     log::error!("kitty_img: {:#}", err);
                 }
@@ -376,6 +576,7 @@ impl<'a> Performer<'a> {
         let seqno = self.seqno;
         self.pop_tmux_title_state();
         self.flush_print();
+        self.placeholder_run.continuable = false;
         match control {
             ControlCode::LineFeed | ControlCode::VerticalTab | ControlCode::FormFeed => {
                 if self.left_and_right_margins.contains(&self.cursor.x) {
@@ -491,6 +692,11 @@ impl<'a> Performer<'a> {
     fn csi_dispatch(&mut self, csi: CSI) {
         self.pop_tmux_title_state();
         self.flush_print();
+        // SGR (attribute changes) should not break placeholder runs;
+        // all other CSI sequences clear the continuable state.
+        if !matches!(&csi, CSI::Sgr(_)) {
+            self.placeholder_run.continuable = false;
+        }
         match csi {
             CSI::Sgr(sgr) => self.state.perform_csi_sgr(sgr),
             CSI::Cursor(wezterm_escape_parser::csi::Cursor::Left(n)) => {
@@ -585,6 +791,7 @@ impl<'a> Performer<'a> {
     fn esc_dispatch(&mut self, esc: Esc) {
         let seqno = self.seqno;
         self.flush_print();
+        self.placeholder_run.continuable = false;
         if esc != Esc::Code(EscCode::StringTerminator) {
             self.pop_tmux_title_state();
         }
@@ -737,6 +944,7 @@ impl<'a> Performer<'a> {
     fn osc_dispatch(&mut self, osc: OperatingSystemCommand) {
         self.pop_tmux_title_state();
         self.flush_print();
+        self.placeholder_run.continuable = false;
         match osc {
             OperatingSystemCommand::SetIconNameSun(title)
             | OperatingSystemCommand::SetIconName(title) => {
