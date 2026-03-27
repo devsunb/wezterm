@@ -7,3 +7,7 @@ ar = "x86_64-w64-mingw32-gcc-ar"
 # enabled for the target, so let's turn that on here.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Local patch to avoid git submodule fetch issues on macOS
+[patch."https://github.com/wezterm/xcb-imdkit-rs.git"]
+xcb-imdkit = { path = "/Users/sunb/dev/sunb/xcb-imdkit-rs" }
