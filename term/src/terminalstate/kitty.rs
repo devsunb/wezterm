@@ -51,24 +51,27 @@ impl KittyImageState {
         }
     }
 
-    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>) {
-        if image_id != 0 {
-            self.remove_data_for_id(image_id);
-        }
-        self.prune_unreferenced();
+    /// Record image data. Returns true if still over budget after pruning (ENOSPC).
+    fn record_id_to_data(&mut self, image_id: u32, data: Arc<ImageData>, budget: usize) -> bool {
+        self.remove_data_for_id(image_id);
+        self.prune_unreferenced(budget);
         self.used_memory += data.len();
         self.id_to_data.insert(image_id, data);
+        // Prune again after inserting to bring usage back under budget,
+        // matching kitty's apply_storage_quota() behavior.
+        self.prune_unreferenced(budget);
+        self.used_memory > budget
     }
 
-    fn prune_unreferenced(&mut self) {
-        let budget = 320 * 1024 * 1024; // FIXME: make this configurable
+    /// Prune unreferenced images to stay within the memory budget.
+    fn prune_unreferenced(&mut self, budget: usize) {
         if self.used_memory > budget {
             let mut referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
             referenced.extend(self.virtual_placements.keys().map(|(k, _)| *k));
             let target = self.used_memory - budget;
             let mut freed = 0;
             self.id_to_data.retain(|id, data| {
-                if referenced.contains(id) || freed > target {
+                if referenced.contains(id) || freed >= target {
                     true
                 } else {
                     freed += data.len();
@@ -87,6 +90,10 @@ impl KittyImageState {
 }
 
 impl TerminalState {
+    fn kitty_image_storage_limit(&self) -> usize {
+        self.config.kitty_image_storage_limit()
+    }
+
     fn kitty_img_place(
         &mut self,
         image_id: Option<u32>,
@@ -493,8 +500,6 @@ impl TerminalState {
                     },
                 verbosity: _,
             } => {
-                // ID-based delete: removes both physical and virtual placements
-                // (unlike position-based deletes which skip virtual placements).
                 if let Some(&image_id) = self.kitty_img.number_to_id.get(&image_number) {
                     self.kitty_remove_placement(image_id, placement_id);
                     if delete {
@@ -632,10 +637,8 @@ impl TerminalState {
         Ok(())
     }
 
-    /// Delete placements matching a position-based predicate (d=c/p/x/y/z/q).
-    /// Virtual placements are NOT affected because they have no screen
-    /// position -- only ID-based deletes (d=i/n/r) remove them, via
-    /// kitty_remove_placement().
+    /// Delete placements matching a predicate.
+    /// Virtual placements are NOT affected (per kitty spec).
     fn kitty_delete_placements_matching(
         &mut self,
         delete_data: bool,
@@ -1146,8 +1149,7 @@ impl TerminalState {
         log::trace!("transmit {:?}", transmit);
         let (id, no) = match (transmit.image_id, transmit.image_number) {
             (Some(_), Some(_)) => {
-                // TODO: send an EINVAL error back here
-                anyhow::bail!("cannot use both i= and I= in the same request");
+                anyhow::bail!("EINVAL:cannot use both i= and I= in the same request");
             }
             (None, None) => {
                 // Assume image id 0
@@ -1226,15 +1228,53 @@ impl TerminalState {
         transmit: KittyImageTransmit,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
-        let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
+        let image_id_hint = transmit.image_id;
+        let image_number_hint = transmit.image_number;
+        let (image_id, image_number, img) = match self.kitty_img_transmit_inner(transmit) {
+            Ok(result) => result,
+            Err(err) => {
+                let msg = format!("{:#}", err);
+                let response = if msg.starts_with("EINVAL:") {
+                    msg
+                } else {
+                    format!("ENOMEM:{}", msg)
+                };
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    image_id_hint,
+                    image_number_hint,
+                    response,
+                );
+                return Err(err);
+            }
+        };
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
-        let img = self
-            .raw_image_to_image_data(img)
-            .context("storing image data")?;
-        self.kitty_img.record_id_to_data(image_id, img);
-
-        if image_number.is_some() {
+        let img = match self.raw_image_to_image_data(img) {
+            Ok(img) => img,
+            Err(err) => {
+                self.kitty_send_response(
+                    verbosity,
+                    false,
+                    Some(image_id),
+                    image_number,
+                    format!("ENOMEM:{:#}", err),
+                );
+                return Err(err.into());
+            }
+        };
+        let budget = self.kitty_image_storage_limit();
+        let over_budget = self.kitty_img.record_id_to_data(image_id, img, budget);
+        if over_budget {
+            self.kitty_send_response(
+                verbosity,
+                false,
+                Some(image_id),
+                image_number,
+                "ENOSPC:insufficient storage space for image".to_string(),
+            );
+        } else if image_number.is_some() {
             self.kitty_send_response(
                 verbosity,
                 true,
