@@ -1774,3 +1774,61 @@ fn test_kitty_position_delete_skips_virtual_placements() {
         "virtual placement should still work after position-based delete"
     );
 }
+
+/// Alt screen switch should preserve primary screen placements and restore
+/// them when returning, matching kitty/ghostty per-screen placement behavior.
+#[test]
+fn test_kitty_alt_screen_preserves_primary_placements() {
+    use base64::Engine;
+
+    let mut term = TestTerm::new_with_kitty(5, 10);
+
+    let rgba_data = vec![
+        255u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+    ];
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&rgba_data);
+
+    // Place image on primary screen at (0,0)
+    term.print("\x1b[H");
+    let place = format!("\x1b_Ga=T,i=1,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place);
+
+    let has_image = |term: &TestTerm, col: usize, row: usize| -> bool {
+        let lines = term.screen().visible_lines();
+        lines
+            .get(row)
+            .and_then(|line| line.get_cell(col))
+            .map(|c| c.attrs().images().is_some())
+            .unwrap_or(false)
+    };
+
+    assert!(
+        has_image(&term, 0, 0),
+        "image should be at (0,0) on primary screen"
+    );
+
+    // Enter alt screen (CSI?1049h)
+    term.print("\x1b[?1049h");
+
+    // Alt screen should NOT have the primary image
+    // (alt screen is fresh, and image cells belong to primary screen buffer)
+
+    // Place a different image on alt screen
+    term.print("\x1b[H");
+    let place_alt = format!("\x1b_Ga=T,i=2,f=32,s=2,v=2,q=2;{}\x1b\\", b64);
+    term.print(&place_alt);
+    assert!(
+        has_image(&term, 0, 0),
+        "image should be at (0,0) on alt screen"
+    );
+
+    // Return to primary screen (CSI?1049l)
+    term.print("\x1b[?1049l");
+
+    // Primary screen image should be restored (placement still tracked)
+    // The image cells are in the primary screen buffer which was preserved.
+    assert!(
+        has_image(&term, 0, 0),
+        "image at (0,0) should be restored on primary screen after alt screen round-trip"
+    );
+}

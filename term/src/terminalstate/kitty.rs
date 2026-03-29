@@ -42,9 +42,32 @@ pub struct KittyImageState {
     placements: HashMap<(u32, Option<u32>), PlacementInfo>,
     pub(crate) virtual_placements: HashMap<(u32, Option<u32>), VirtualPlacement>,
     used_memory: usize,
+    /// Saved placements from the other screen buffer (primary/alt).
+    /// Swapped on alt screen toggle so each screen keeps its own placements.
+    pub(crate) saved_placements: HashMap<(u32, Option<u32>), PlacementInfo>,
+    pub(crate) saved_virtual_placements: HashMap<(u32, Option<u32>), VirtualPlacement>,
 }
 
 impl KittyImageState {
+    /// Swap active placements with saved placements (for alt screen toggle).
+    /// Image data (`id_to_data`) is shared across both screens.
+    pub(crate) fn swap_placements(&mut self) {
+        std::mem::swap(&mut self.placements, &mut self.saved_placements);
+        std::mem::swap(
+            &mut self.virtual_placements,
+            &mut self.saved_virtual_placements,
+        );
+    }
+
+    /// Clear active placements without touching the screen model.
+    /// Used after `swap_placements` to discard stale placements loaded
+    /// from a different screen buffer, where model cleanup would target
+    /// the wrong screen's stable row indices.
+    pub(crate) fn clear_placements_no_model(&mut self) {
+        self.placements.clear();
+        self.virtual_placements.clear();
+    }
+
     fn remove_data_for_id(&mut self, image_id: u32) {
         if let Some(data) = self.id_to_data.remove(&image_id) {
             self.used_memory = self.used_memory.saturating_sub(data.len());
@@ -68,6 +91,9 @@ impl KittyImageState {
         if self.used_memory > budget {
             let mut referenced: HashSet<u32> = self.placements.keys().map(|(k, _)| *k).collect();
             referenced.extend(self.virtual_placements.keys().map(|(k, _)| *k));
+            // Also protect images referenced by the other screen's placements.
+            referenced.extend(self.saved_placements.keys().map(|(k, _)| *k));
+            referenced.extend(self.saved_virtual_placements.keys().map(|(k, _)| *k));
             let target = self.used_memory - budget;
             let mut freed = 0;
             self.id_to_data.retain(|id, data| {
@@ -639,7 +665,7 @@ impl TerminalState {
 
     /// Delete placements matching a predicate.
     /// Virtual placements are NOT affected (per kitty spec).
-    fn kitty_delete_placements_matching(
+    pub(crate) fn kitty_delete_placements_matching(
         &mut self,
         delete_data: bool,
         predicate: impl Fn(&PlacementInfo) -> bool,
@@ -733,11 +759,14 @@ impl TerminalState {
         for ((image_id, p), info) in std::mem::take(&mut self.kitty_img.placements).into_iter() {
             self.kitty_remove_placement_from_model(image_id, p, info);
         }
-        // d=a: remove physical placements only, keep data and virtual placements.
-        // d=A: remove everything including data; virtual placements become
-        // invalid without backing data, so clear them too.
+        // d=a: remove all placements (including virtual) but keep image data.
+        // d=A: remove everything including data (both screens).
+        // Matches kitty's handle_delete_all_images() which calls
+        // remove_from_virtual_placements() for every image.
+        self.kitty_img.virtual_placements.clear();
         if delete {
-            self.kitty_img.virtual_placements.clear();
+            self.kitty_img.saved_placements.clear();
+            self.kitty_img.saved_virtual_placements.clear();
             self.kitty_img.id_to_data.clear();
             self.kitty_img.used_memory = 0;
             self.kitty_img.number_to_id.clear();
