@@ -104,21 +104,35 @@ impl core::fmt::Debug for KittyImageData {
 }
 
 impl KittyImageData {
+    const MAX_FILE_PATH_LEN: usize = 2048;
+
     fn from_keys(keys: &BTreeMap<&str, &str>, payload: &[u8]) -> Option<Self> {
         let t = get(keys, "t").unwrap_or("d");
 
         match t {
             "d" => Some(Self::Direct(String::from_utf8(payload.to_vec()).ok()?)),
-            "f" => Some(Self::File {
-                path: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
-                data_size: geti(keys, "S"),
-                data_offset: geti(keys, "O"),
-            }),
-            "t" => Some(Self::TemporaryFile {
-                path: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
-                data_size: geti(keys, "S"),
-                data_offset: geti(keys, "O"),
-            }),
+            "f" => {
+                let path = String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?;
+                if path.len() > Self::MAX_FILE_PATH_LEN {
+                    return None;
+                }
+                Some(Self::File {
+                    path,
+                    data_size: geti(keys, "S"),
+                    data_offset: geti(keys, "O"),
+                })
+            }
+            "t" => {
+                let path = String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?;
+                if path.len() > Self::MAX_FILE_PATH_LEN {
+                    return None;
+                }
+                Some(Self::TemporaryFile {
+                    path,
+                    data_size: geti(keys, "S"),
+                    data_offset: geti(keys, "O"),
+                })
+            }
             "s" => Some(Self::SharedMem {
                 name: String::from_utf8(base64_decode(payload.to_vec()).ok()?).ok()?,
                 data_size: geti(keys, "S"),
@@ -181,6 +195,13 @@ impl KittyImageData {
             data_offset: Option<u32>,
             data_size: Option<u32>,
         ) -> std::io::Result<Vec<u8>> {
+            let metadata = std::fs::metadata(path)?;
+            if !metadata.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} is not a regular file", path),
+                ));
+            }
             let mut f = std::fs::File::open(path)?;
             if let Some(offset) = data_offset {
                 f.seek(std::io::SeekFrom::Start(offset.into()))?;
@@ -214,6 +235,18 @@ impl KittyImageData {
                 data_offset,
                 data_size,
             } => {
+                // Kitty spec: temp file path must contain "tty-graphics-protocol"
+                if !path.contains("tty-graphics-protocol") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "kitty image protocol temporary file {} does not contain \
+                             'tty-graphics-protocol' in its path",
+                            path
+                        ),
+                    ));
+                }
+
                 let data = read_from_file(&path, data_offset, data_size)?;
                 // need to sanity check that the path looks like a reasonable
                 // temporary directory path before blindly unlinking it here.
