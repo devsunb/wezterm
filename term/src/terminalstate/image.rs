@@ -293,6 +293,16 @@ impl TerminalState {
 
 pub(crate) fn check_image_dimensions(width: u32, height: u32) -> anyhow::Result<()> {
     const MAX_IMAGE_SIZE: u32 = 100_000_000;
+    const MAX_IMAGE_DIMENSION: u32 = 10_000;
+    if width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
+        anyhow::bail!(
+            "Ignoring image with dimensions {}x{} \
+             because it exceeds maximum allowed dimension {}",
+            width,
+            height,
+            MAX_IMAGE_DIMENSION,
+        );
+    }
     let size = width.saturating_mul(height).saturating_mul(4);
     if size > MAX_IMAGE_SIZE {
         anyhow::bail!(
