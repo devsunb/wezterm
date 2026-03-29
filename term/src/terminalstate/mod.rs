@@ -1425,6 +1425,8 @@ impl TerminalState {
                 self.screen.activate_primary_screen(self.seqno);
                 self.screen.saved_cursor().take();
                 self.kitty_remove_all_placements(true);
+                self.kitty_img.saved_placements.clear();
+                self.kitty_img.saved_virtual_placements.clear();
 
                 self.reverse_wraparound_mode = false;
                 self.reverse_video_mode = false;
@@ -1827,6 +1829,8 @@ impl TerminalState {
                 DecPrivateModeCode::EnableAlternateScreen,
             )) => {
                 if !self.screen.is_alt_screen_active() {
+                    self.kitty_img.swap_placements();
+                    self.kitty_img.clear_placements_no_model();
                     self.screen.activate_alt_screen(self.seqno);
                     self.pen = CellAttributes::default();
                 }
@@ -1837,6 +1841,7 @@ impl TerminalState {
                 if self.screen.is_alt_screen_active() {
                     self.pen = CellAttributes::default();
                     self.erase_in_display(EraseInDisplay::EraseDisplay);
+                    self.kitty_img.swap_placements();
                     self.screen.activate_primary_screen(self.seqno);
                 }
             }
@@ -1845,6 +1850,7 @@ impl TerminalState {
                 DecPrivateModeCode::EnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
+                    self.kitty_img.swap_placements();
                     self.screen.activate_primary_screen(self.seqno);
                     self.pen = CellAttributes::default();
                 }
@@ -2042,6 +2048,8 @@ impl TerminalState {
             )) => {
                 if !self.screen.is_alt_screen_active() {
                     self.dec_save_cursor();
+                    self.kitty_img.swap_placements();
+                    self.kitty_img.clear_placements_no_model();
                     self.screen.activate_alt_screen(self.seqno);
                     self.set_cursor_pos(&Position::Absolute(0), &Position::Absolute(0));
                     self.pen = CellAttributes::default();
@@ -2052,6 +2060,7 @@ impl TerminalState {
                 DecPrivateModeCode::ClearAndEnableAlternateScreen,
             )) => {
                 if self.screen.is_alt_screen_active() {
+                    self.kitty_img.swap_placements();
                     self.screen.activate_primary_screen(self.seqno);
                     self.dec_restore_cursor();
                 }
@@ -2275,6 +2284,20 @@ impl TerminalState {
                 return;
             }
         };
+
+        // Kitty spec: ESC[2J clears visible image placements only.
+        // Unlike kitty (which has per-screen graphics managers), wezterm
+        // shares a single placement store across screens, so we must
+        // filter to only remove placements overlapping the visible area.
+        if matches!(erase, EraseInDisplay::EraseDisplay) {
+            let top = self.screen().visible_row_to_stable_row(0);
+            let bot = self
+                .screen()
+                .visible_row_to_stable_row(self.screen().physical_rows as i64 - 1);
+            self.kitty_delete_placements_matching(false, |info| {
+                info.first_row + info.rows as StableRowIndex > top && info.first_row <= bot
+            });
+        }
 
         {
             let bidi_mode = self.get_bidi_mode();
