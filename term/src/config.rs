@@ -176,6 +176,10 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
         false
     }
 
+    fn kitty_image_storage_limit(&self) -> usize {
+        320 * 1024 * 1024
+    }
+
     fn enable_kitty_keyboard(&self) -> bool {
         false
     }
